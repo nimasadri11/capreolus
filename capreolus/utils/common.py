@@ -53,13 +53,13 @@ class Anserini:
             logger.log(loglevel, "[AnseriniProcess] %s", msg)
 
 
-def download_file(url, outfn, expected_hash=None):
+def download_file(url, outfn, expected_hash=None, hash_type="sha356"):
     """Download url to the file outfn. If expected_hash is provided, use it to both verify the file was downloaded
     correctly, and to avoid re-downloading an existing file with a matching hash.
     """
 
     if expected_hash and os.path.exists(outfn):
-        found_hash = hash_file(outfn)
+        found_hash = hash_file(outfn, hash_type=hash_type)
 
         if found_hash == expected_hash:
             return
@@ -77,23 +77,26 @@ def download_file(url, outfn, expected_hash=None):
     if not expected_hash:
         return
 
-    found_hash = hash_file(outfn)
+    found_hash = hash_file(outfn, hash_type=hash_type)
     if found_hash != expected_hash:
         raise IOError(f"expected file {outfn} downloaded from {url} to have SHA256 hash {expected_hash} but got {found_hash}")
 
 
-def hash_file(fn):
+def hash_file(fn, hash_type="sha256"):
     """Compute a SHA-256 hash for the file fn and return a hexdigest of the hash"""
-    sha = hashlib.sha256()
+    if hash_type == "sha256":
+        hash = hashlib.sha256()
+    elif hash_type == "md5":
+        hash = hashlib.md5()
 
     with open(fn, "rb") as f:
         while True:
             data = f.read(65536)
             if not data:
                 break
-            sha.update(data)
+            hash.update(data)
 
-    return sha.hexdigest()
+    return hash.hexdigest()
 
 
 def padlist(list_to_pad, padlen, pad_token=0):

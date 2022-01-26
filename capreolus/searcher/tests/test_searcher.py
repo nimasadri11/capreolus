@@ -16,6 +16,7 @@ skip_searchers = {
     "msmarcopsg",
     "msmarcopsgbm25",
     "static_tct_colbert",
+    "msv2bm25",
     "msptop200",
 }
 searchers = set(module_registry.get_module_names("searcher")) - skip_searchers
