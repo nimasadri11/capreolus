@@ -16,8 +16,8 @@ logger = get_logger(__name__)
 
 def validate(build_f):
     def validate_folds_file(self):
-        if not hasattr(self, "fold_file"):
-            logger.warning(f"Folds file is not found for Module {self.module_name}")
+        if not hasattr(self, "fold_file") or (self.fold_file is None):
+            logger.warning(f"Folds file is not found or undefined for Module {self.module_name}")
             return
 
         if self.fold_file.suffix != ".json":
@@ -35,8 +35,8 @@ def validate(build_f):
         logger.info("Folds file validation finishes.")
 
     def validate_qrels_file(self):
-        if not hasattr(self, "qrel_file"):
-            logger.warning(f"Qrel file is not found for Module {self.module_name}")
+        if not hasattr(self, "qrel_file") or (self.qrel_file is None):
+            logger.warning(f"Qrel file is not found or undefined for Module {self.module_name}")
             return
 
         n_dup, qrels = 0, defaultdict(dict)
@@ -219,6 +219,11 @@ class IRDBenchmark(Benchmark):
         qrels = {}
         for name in self.ird_dataset_names:
             dataset = ir_datasets.load(name)
+
+            if not hasattr(dataset, "qrels_iter"):
+                logger.warning(f"Dataset {name} has no available qrels.")
+                continue
+
             for qrel in dataset.qrels_iter():
                 qrels.setdefault(qrel.query_id, {})
                 qrels[qrel.query_id][qrel.doc_id] = max(qrel.relevance, qrels[qrel.query_id].get(qrel.doc_id, -1))

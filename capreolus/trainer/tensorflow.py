@@ -91,14 +91,39 @@ class TensorflowTrainer(Trainer):
         ConfigOption("decay", 0.0, "learning rate decay"),
         ConfigOption("decayiters", 3),
         ConfigOption("decaytype", None),
-        ConfigOption("amp", False, "use automatic mixed precision"),
+        ConfigOption("amp", None, "Automatic mixed precision mode; one of: None, both"),
     ]
     config_keys_not_in_path = ["fastforward", "boardname", "usecache", "tpuname", "tpuzone", "storage"]
 
     def build(self):
+        if self.config["batch"] < 1:
+            raise ValueError("batch must be >= 1")
+
+        if self.config["evalbatch"] < 0:
+            raise ValueError("evalbatch must be 0 (to use the training batch size) or  >= 1")
+
+        if self.config["niters"] <= 0:
+            raise ValueError("niters must be > 0")
+
+        if self.config["niters"] < self.config["validatefreq"]:
+            raise ValueError("niters must be equal or greater than validatefreq")
+
+        if self.config["itersize"] < self.config["batch"]:
+            raise ValueError("itersize must be >= batch")
+
+        if self.config["lr"] <= 0:
+            raise ValueError("lr must be > 0")
+
+        if self.config["bertlr"] <= 0:
+            raise ValueError("bertlr must be > 0")
+
+        if self.config["amp"] not in (None, "both"):
+            raise ValueError("amp must be one of: None, both")
+
         tf.random.set_seed(self.config["seed"])
 
         self.evalbatch = self.config["evalbatch"] if self.config["evalbatch"] > 0 else self.config["batch"]
+        self.amp = self.config["amp"] == "both"
 
         if os.environ.get("CAPR_QUEUE_SKIP_TPU") == "YES":
             return
@@ -127,7 +152,7 @@ class TensorflowTrainer(Trainer):
         else:  # default strategy that works on CPU and single GPU
             self.strategy = tf.distribute.get_strategy()
 
-        self.amp = self.config["amp"]
+        # self.amp = self.config["amp"]
         if self.amp:
             policy = mixed_precision.Policy("mixed_bfloat16" if self.tpu else "mixed_float16")
             mixed_precision.set_policy(policy)

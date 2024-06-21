@@ -1,20 +1,60 @@
 import os
+import gzip
 import gdown
 from pathlib import Path
 from collections import defaultdict
 
 from capreolus import ConfigOption, Dependency
 from capreolus.utils.loginit import get_logger
+from capreolus.utils.common import download_file
+from capreolus.utils.caching import cached_file, TargetFileExists
 
 from . import Searcher
 from .anserini import BM25
 
 logger = get_logger(__name__)
+import logging
+
+logger.setLevel(logging.DEBUG)
 
 SUPPORTED_TRIPLE_FILE = ["small", "large.v1", "large.v2"]
 
 
+def _prepare_non_train_topic_fn(input_topics_fn, output_topics_fn, train_qids):
+    """Extract the queries in `input_topics_fn` that not in training set into `output_topics_fn`"""
+    if not isinstance(input_topics_fn, Path):
+        input_topics_fn = Path(input_topics_fn)
+    if not isinstance(output_topics_fn, Path):
+        output_topics_fn = Path(output_topics_fn)
+
+    if output_topics_fn.exists():
+        logger.info(f"Use cached {output_topics_fn}.")
+        return output_topics_fn
+
+    output_topics_fn.parent.mkdir(parents=True, exist_ok=True)
+
+    line_i = 0
+    try:
+        with cached_file(output_topics_fn) as tmp_fn:
+            with open(input_topics_fn) as f, open(tmp_fn, "wt") as fout:
+                for line in f:
+                    line_i += 1
+                    qid, _ = line.strip().split("\t")
+                    if qid not in train_qids:
+                        fout.write(line)
+    except TargetFileExists as e:
+        logger.info(f"Use cached file {output_topics_fn}.")
+    except Exception as e:
+        # note: file removal has been handled inside cached_file
+        err_name = type(e).__name__
+        line_info = f" (Line #{line_i})." if (line_i > 0) else ""
+        logger.error(f"Encounter {err_name} while preparing non-train topic file: {input_topics_fn}{line_info}.")
+        logging.error(f"Removing {output_topics_fn}.")
+        raise e
+
+
 class MsmarcoPsgSearcherMixin:
+    # todo: avoid loading the entire runs into memory, combine two runfiles directly
     @staticmethod
     def convert_to_trec_runs(msmarco_top1k_fn, style="eval"):
         logger.info(f"Converting file {msmarco_top1k_fn} (with style {style}) into trec format")
@@ -68,6 +108,44 @@ class MsmarcoPsgSearcherMixin:
         return self.convert_to_trec_runs(triple_fn, style="triple")
 
 
+class MSMARCO_V2_SearcherMixin:
+    def get_train_runfile(self):
+        raise NotImplementedError
+
+    def combine_train_and_dev_runfile(self, dev_test_runfile, final_runfile, final_donefn):
+        train_runfile = self.get_train_runfile()
+        assert os.path.exists(dev_test_runfile)
+
+        train_open_handler = gzip.open if train_runfile.suffix == ".gz" else open
+        dev_open_handler = gzip.open if dev_test_runfile.suffix == ".gz" else open
+
+        # write train and dev, test runs into final searcher file
+        try:
+            with cached_file(final_runfile) as tmp_fn:
+                with open(tmp_fn, "w") as fout:
+                    with train_open_handler(train_runfile) as fin:
+                        for line in fin:
+                            line = line if isinstance(line, str) else line.decode()
+                            fout.write(line)
+
+                    with dev_open_handler(dev_test_runfile) as fin:
+                        for line in fin:
+                            line = line if isinstance(line, str) else line.decode()
+                            fout.write(line)
+
+        except TargetFileExists as e:
+            logger.info(f"Use cached file {final_runfile}.")
+        except Exception as e:
+            # note: file removal has been handled inside cached_file
+            err_name = type(e).__name__
+            logger.error(f"Encounter {err_name} while combining train and non-train runfile: {final_runfile}.")
+            logging.error(f"Removing {final_runfile}.")
+            raise e
+
+        with open(final_donefn, "w") as f:
+            f.write("done")
+
+
 @Searcher.register
 class MsmarcoPsg(Searcher, MsmarcoPsgSearcherMixin):
     """
@@ -81,10 +159,10 @@ class MsmarcoPsg(Searcher, MsmarcoPsgSearcherMixin):
         ConfigOption("tripleversion", "small", "version of triplet.qid file, small, large.v1 or large.v2"),
     ]
 
-    def _query_from_file(self, topicsfn, output_path, cfg):
+    def _query_from_file(self, topicsfn, output_path, config):
         """only query results in dev and test set are saved"""
-        final_runfn = Path(output_path) / "searcher"
-        final_donefn = Path(output_path) / "done"
+        final_runfn = output_path / "searcher"
+        final_donefn = output_path / "done"
         if os.path.exists(final_donefn):
             return output_path
 
@@ -142,13 +220,11 @@ class MsmarcoPsgBm25(BM25, MsmarcoPsgSearcherMixin):
         tmp_output_dir.mkdir(exist_ok=True, parents=True)
 
         train_runs = self.download_and_prepare_train_set(tmp_dir=tmp_dir)
-        if not os.path.exists(tmp_topicsfn):
-            with open(tmp_topicsfn, "wt") as fout:
-                with open(topicsfn) as f:
-                    for line in f:
-                        qid, title = line.strip().split("\t")
-                        if qid not in self.benchmark.folds["s1"]["train_qids"]:
-                            fout.write(line)
+        _prepare_non_train_topic_fn(
+            input_topics_fn=topicsfn,
+            output_topics_fn=tmp_topicsfn,
+            train_qids=self.benchmark.folds["s1"]["train_qids"],
+        )
 
         super()._query_from_file(topicsfn=tmp_topicsfn, output_path=tmp_output_dir, config=config)
         dev_test_runfile = tmp_output_dir / "searcher"
@@ -162,6 +238,97 @@ class MsmarcoPsgBm25(BM25, MsmarcoPsgSearcherMixin):
 
         with open(final_donefn, "w") as f:
             f.write("done")
+        return output_path
+
+
+@Searcher.register
+class MSMARCO_V2_Bm25(BM25, MSMARCO_V2_SearcherMixin):
+    """
+    Skip the searching on training set by converting the official training triplet into a "fake" runfile.
+    Conduct configurable BM25 search on the development and the test set.
+    """
+
+    module_name = "msv2bm25"
+    dependencies = [
+        Dependency(key="benchmark", module="benchmark"),
+        Dependency(key="index", module="index", name="anserini"),
+    ]
+    config_spec = BM25.config_spec
+
+    def get_train_runfile(self):
+        tmp_path = self.get_cache_path() / "tmp"
+        if self.benchmark.module_name in ["mspsg_v2"]:
+            url = "https://msmarco.blob.core.windows.net/msmarcoranking/passv2_train_top100.txt.gz"
+            md5sum = "7cd731ed984fccb2396f11a284cea800"
+        elif self.benchmark.module_name in ["msdoc_v2"]:
+            url = "https://msmarco.blob.core.windows.net/msmarcoranking/docv2_train_top100.txt.gz"
+            md5sum = "b4d5915172d5f54bd23c31e966c114de"
+        else:
+            raise ValueError(
+                f"Unexpected benchmark, should be either mspsg_v2 or msdoc_v2, but got {self.benchmark.module_name}."
+            )
+
+        gz_name = url.split("/")[-1]
+        gz_file_path = tmp_path / gz_name
+        download_file(url, gz_file_path, expected_hash=md5sum, hash_type="md5")
+        return gz_file_path
+
+    def _query_from_file(self, topicsfn, output_path, config):
+        final_runfn = os.path.join(output_path, "searcher")
+        final_donefn = os.path.join(output_path, "done")
+        if os.path.exists(final_donefn):
+            return output_path
+
+        output_path.mkdir(exist_ok=True, parents=True)
+        tmp_dir = self.get_cache_path() / "tmp"
+        tmp_topicsfn = tmp_dir / os.path.basename(topicsfn)
+        tmp_output_dir = tmp_dir / "BM25_results"
+        tmp_output_dir.mkdir(exist_ok=True, parents=True)
+        logger.debug("File output to - ", tmp_output_dir)
+
+        # run bm25 on dev and test set
+        _prepare_non_train_topic_fn(
+            input_topics_fn=topicsfn,
+            output_topics_fn=tmp_topicsfn,
+            train_qids=self.benchmark.folds["s1"]["train_qids"],
+        )
+
+        logger.info("Searching non-training queries")
+        super()._query_from_file(topicsfn=tmp_topicsfn, output_path=tmp_output_dir, config=config)
+        self.combine_train_and_dev_runfile(tmp_output_dir / "searcher", final_runfn, final_donefn)
+        return output_path
+
+
+# todo: generalize the following two searchers
+@Searcher.register
+class MSMARCO_V2_Customize(Searcher, MSMARCO_V2_SearcherMixin):
+    """This searcher allows to rerank an external runfile"""
+
+    module_name = "msv2cust"
+    dependencies = [
+        Dependency(key="benchmark", module="benchmark", name="ms_v2"),
+    ]
+    config_spec = [
+        ConfigOption("path", None, "path to the external trec-format runfile"),
+    ]
+
+    def get_train_runfile(self):
+        basename = f"{self.benchmark.dataset_type}v2_train_top100.txt"
+        return self.benchmark.data_dir / basename
+
+    def _query_from_file(self, topicsfn, output_path, config):
+        final_runfn = os.path.join(output_path, "searcher")
+        final_donefn = os.path.join(output_path, "done")
+        if os.path.exists(final_donefn):
+            return output_path
+
+        output_path.mkdir(exist_ok=True, parents=True)
+
+        runfile_path = self.config["path"]
+        if not os.path.exists(runfile_path):
+            raise IOError(f"Could not find the provided runfile: {runfile_path}")
+
+        self.combine_train_and_dev_runfile(runfile_path, final_runfn, final_donefn)
         return output_path
 
 
@@ -180,9 +347,8 @@ class StaticTctColBertDev(Searcher, MsmarcoPsgSearcherMixin):
     ]
 
     def _query_from_file(self, topicsfn, output_path, cfg):
-        outfn = Path(output_path) / "static.run"
-        done_fn = Path(output_path) / "done"
-        if done_fn.exists():
+        outfn = output_path / "static.run"
+        if outfn.exists():
             return outfn
 
         tmp_dir = self.get_cache_path() / "tmp"
@@ -205,101 +371,4 @@ class StaticTctColBertDev(Searcher, MsmarcoPsgSearcherMixin):
             for line in f:
                 qid, docid, rank, score = line.strip().split("\t")
                 fout.write(f"{qid} Q0 {docid} {rank} {score} tct_colbert\n")
-
-        with open(done_fn, "wt") as f:
-            print("done", file=f)
-
-        return outfn
-
-
-@Searcher.register
-class MsmarcoPsgTop200(Searcher, MsmarcoPsgSearcherMixin):
-    """
-    Skip the searching on training set by converting the official training triplet into a "fake" runfile.
-    Use the runfile pre-prepared using TCT-ColBERT (https://cs.uwaterloo.ca/~jimmylin/publications/Lin_etal_2021_RepL4NLP.pdf)
-    """
-
-    module_name = "msptop200"
-    dependencies = [Dependency(key="benchmark", module="benchmark", name="msmarcopsg")]
-    config_spec = [
-        ConfigOption(
-            "firststage",
-            "tct",
-            "Options: tct, bm25, tct>bm25, bm25>tct. where config before > stands for training set source, and that after > stands for dev and test source.",
-        )
-    ]
-
-    def get_train_url(self):
-        train_first_stage = self.config["firststage"].split(">")[0]
-
-        url_template = "https://drive.google.com/uc?id="
-        assert train_first_stage in {"bm25", "tct"}
-        file_id = "10VjzcDUtZwJWoWUlVnjtyI4j5K6c-882" if train_first_stage == "tct" else "1ZgrxqdbV3-YbF9PnOVtSIx04RqG-YOMW"
-        return url_template + file_id
-
-    def get_dev_url(self):
-        dev_first_stage = self.config["firststage"]
-        if ">" in dev_first_stage:
-            dev_first_stage = dev_first_stage.split(">")[1]
-
-        url_template = "https://drive.google.com/uc?id="
-        assert dev_first_stage in {"bm25", "tct"}
-        file_id = "1WBUashNhtJKNsKYBzeR4IxcMzbjqiqg6" if dev_first_stage == "tct" else "1PWuDcr8c4EIB-mxdFY7-KkTezJ7aN0Fq"
-        return url_template + file_id
-
-    def get_test_url(self):
-        dev_first_stage = self.config["firststage"]
-        if ">" in dev_first_stage:
-            dev_first_stage = dev_first_stage.split(">")[1]
-
-        url_template = "https://drive.google.com/uc?id="
-        assert dev_first_stage in {"tct"}, "Only support inference on tct test set for now"
-        file_id = "1U4DBP_3HBXC8EJNbI_wFUVoZnt7FiPbe"
-        return url_template + file_id
-
-    def _query_from_file(self, topicsfn, output_path, cfg):
-        outfn = Path(output_path) / "static.run"
-        done_fn = Path(output_path) / "done"
-
-        if done_fn.exists():
-            assert outfn.exists()
-            return outfn
-
-        tmp_dir = self.get_cache_path() / "tmp"
-        os.makedirs(tmp_dir, exist_ok=True)
-        output_path.mkdir(exist_ok=True, parents=True)
-
-        tag = self.config["firststage"]
-        fout = open(outfn, "wt")
-
-        url_lists = [self.get_train_url(), self.get_dev_url()]
-        if tag == "tct":
-            url_lists.append(self.get_test_url())
-
-        for set_name, url in zip(["train", "dev", "test"], url_lists):
-            if set_name == "test":
-                assert tag == "tct"
-
-            # basename = self.get_fn_from_url(url)
-            basename = f"{tag}-{set_name}"
-            tmp_fn = tmp_dir / basename
-
-            # download the file
-            if not os.path.exists(tmp_fn):
-                gdown.download(url, tmp_fn.as_posix(), quiet=False)
-
-            # convert into trec and combine
-            with open(tmp_fn, "rt") as f:
-                for line in f:
-                    try:
-                        qid, docid, rank = line.strip().split()
-                    except:
-                        raise ValueError("This line cannot be parsed:" + line)
-
-                    score = 1000 - int(rank)
-                    fout.write(f"{qid} Q0 {docid} {rank} {score} {tag}\n")
-
-        with open(done_fn, "wt") as f:
-            print("done", file=f)
-
         return outfn
